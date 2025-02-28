@@ -22,79 +22,88 @@ class CelestialNavigator:
         return radians * 180.0 / math.pi
 
     def calculate_position(self, sun_elevation, sun_bearing, timestamp, height_meters=0):
-        """Calculate latitude and longitude with improved accuracy."""
-        # Apply corrections
+        """
+        Calculate latitude and longitude using celestial navigation.
+        
+        Args:
+            sun_elevation: Measured elevation angle in degrees
+            sun_bearing: Measured bearing (azimuth) in degrees
+            timestamp: UTC timestamp of observation
+            height_meters: Observer's height above sea level in meters
+        
+        Returns:
+            tuple: (latitude, longitude) in degrees
+        """
+        # Apply corrections to elevation
         corrected_elevation = self._correct_for_dip(sun_elevation, height_meters)
         corrected_elevation = self._correct_for_refraction(corrected_elevation)
         corrected_elevation = self._correct_for_parallax(corrected_elevation, timestamp)
         
-        # Create observer to get sun's declination
+        # Convert elevation and bearing to radians
+        h = self._degrees_to_radians(corrected_elevation)  # Height/altitude
+        Az = self._degrees_to_radians(sun_bearing)         # Azimuth
+        
+        # Get sun's declination for the given time
         observer = ephem.Observer()
         observer.date = timestamp
         self.sun.compute(observer)
+        d = float(self.sun.dec)  # Declination in radians
         
-        # Get sun's declination
-        declination = float(self.sun.dec)  # Already in radians
+        # Calculate latitude using the navigational triangle
+        # sin(h) = sin(d)sin(L) + cos(d)cos(L)cos(t)
+        # where h is height, d is declination, L is latitude, t is hour angle
         
-        # Convert our measurements to radians
-        elevation = self._degrees_to_radians(corrected_elevation)
-        azimuth = self._degrees_to_radians(sun_bearing)
+        # Calculate latitude using the altitude formula
+        sin_L = (math.sin(h) - math.sin(d) * math.cos(Az)) / (math.cos(d) * math.sin(Az))
+        L = math.asin(max(-1.0, min(1.0, sin_L)))  # Latitude in radians
         
-        # Calculate hour angle (in radians)
-        hour_angle = math.atan2(
-            -math.cos(elevation) * math.sin(azimuth),
-            math.sin(elevation) * math.cos(declination) - 
-            math.cos(elevation) * math.sin(declination) * math.cos(azimuth)
-        )
+        # Calculate Local Hour Angle (t)
+        cos_t = (math.sin(h) - math.sin(d) * math.sin(L)) / (math.cos(d) * math.cos(L))
+        t = math.acos(max(-1.0, min(1.0, cos_t)))
         
-        # Calculate latitude
-        latitude = math.asin(
-            math.sin(elevation) * math.sin(declination) +
-            math.cos(elevation) * math.cos(declination) * math.cos(azimuth)
-        )
+        # Adjust hour angle based on azimuth quadrant
+        if 0 <= sun_bearing <= 180:
+            t = -t  # Morning (sun in eastern sky)
+        
+        # Get Greenwich Mean Sidereal Time
+        gmst = float(observer.sidereal_time())  # Returns GMST in hours
+        gmst_rad = gmst * 2 * math.pi / 24.0    # Convert hours to radians
         
         # Calculate longitude
-        # Get Greenwich Mean Sidereal Time in radians
-        gmst = ephem.gmst(observer.date) * 2 * math.pi / 24
-        longitude = gmst - hour_angle
+        # Longitude = Hour Angle + GMST
+        lon = t + gmst_rad
         
         # Normalize longitude to [-π, π]
-        longitude = ((longitude + math.pi) % (2 * math.pi)) - math.pi
+        lon = ((lon + math.pi) % (2 * math.pi)) - math.pi
         
-        return self._radians_to_degrees(latitude), self._radians_to_degrees(longitude)
+        # Convert to degrees
+        latitude = self._radians_to_degrees(L)
+        longitude = self._radians_to_degrees(lon)
+        
+        return latitude, longitude
 
     def _correct_for_refraction(self, apparent_elevation):
-        """
-        Correct for atmospheric refraction.
+        """Correct for atmospheric refraction."""
+        # Skip correction for invalid elevations
+        if apparent_elevation > 90 or apparent_elevation < -90:
+            return apparent_elevation
         
-        Args:
-            apparent_elevation: Measured elevation in degrees
+        # Convert to radians
+        h = self._degrees_to_radians(apparent_elevation)
         
-        Returns:
-            float: Corrected elevation in degrees
-        """
-        # Standard temperature (15°C) and pressure (1013.25 hPa)
-        if apparent_elevation < 15:
-            # More accurate formula for low elevations
-            tan_e = math.tan(self._degrees_to_radians(apparent_elevation))
-            refraction_correction = 1.02 / tan_e - 0.0019279
+        # Use more accurate refraction formula
+        if apparent_elevation >= 15:
+            # Saemundsson's formula for higher elevations
+            R = 1.02 / math.tan(h + 10.3/(apparent_elevation + 5.11))
         else:
-            # Simpler formula for higher elevations
-            refraction_correction = 1.0 / math.tan(self._degrees_to_radians(apparent_elevation + 7.31)) - 0.0068
-
-        return apparent_elevation - refraction_correction / 60  # Convert arcminutes to degrees
+            # Bennet's formula for low elevations
+            R = 1.0 / math.tan(h) + 0.0019279
+        
+        # Convert from arcminutes to degrees and subtract from apparent elevation
+        return apparent_elevation - R/60.0
 
     def _correct_for_parallax(self, elevation, timestamp):
-        """
-        Correct for solar parallax.
-        
-        Args:
-            elevation: Measured elevation in degrees
-            timestamp: Time of observation
-        
-        Returns:
-            float: Corrected elevation in degrees
-        """
+        """Correct for solar parallax."""
         observer = ephem.Observer()
         observer.date = timestamp
         self.sun.compute(observer)
@@ -102,30 +111,28 @@ class CelestialNavigator:
         # Get sun's distance in AU
         sun_distance = self.sun.earth_distance
         
-        # Earth radius in AU (approximate)
+        # Earth radius in AU
         earth_radius = 6378137.0 / 149597870700.0
         
+        # Calculate parallax correction
         parallax = math.asin(earth_radius / sun_distance)
-        parallax_correction = parallax * math.cos(self._degrees_to_radians(elevation))
         
-        return elevation + self._radians_to_degrees(parallax_correction)
+        # Apply correction based on elevation
+        h = self._degrees_to_radians(elevation)
+        correction = self._radians_to_degrees(parallax * math.cos(h))
+        
+        return elevation + correction
 
     def _correct_for_dip(self, elevation, height_meters):
-        """
-        Correct for geometric dip of horizon due to height above sea level.
+        """Correct for geometric dip of horizon."""
+        if height_meters <= 0:
+            return elevation
         
-        Args:
-            elevation: Measured elevation in degrees
-            height_meters: Height above sea level in meters
+        # Calculate dip correction
+        # More accurate formula including refraction
+        dip = 0.0293 * math.sqrt(height_meters)
         
-        Returns:
-            float: Corrected elevation in degrees
-        """
-        # Pure geometric dip correction in degrees
-        # Formula: dip = arccos(R/(R+h)) where R is Earth's radius
-        earth_radius = 6371000  # meters
-        dip_correction = math.acos(earth_radius / (earth_radius + height_meters))
-        return elevation - self._radians_to_degrees(dip_correction)
+        return elevation - dip
 
 def get_position(elevation, bearing, timestamp, height_meters=0):
     """
@@ -140,6 +147,11 @@ def get_position(elevation, bearing, timestamp, height_meters=0):
     Returns:
         tuple: (latitude, longitude) in degrees
     """
+    # Ensure timestamp is in UTC
+    if timestamp.tzinfo is None:
+        raise ValueError("Timestamp must include timezone information")
+    timestamp = timestamp.astimezone(datetime.timezone.utc)
+    
     navigator = CelestialNavigator()
     return navigator.calculate_position(elevation, bearing, timestamp, height_meters)
 
